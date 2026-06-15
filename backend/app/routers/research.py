@@ -1,5 +1,5 @@
 import json
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from fastapi import APIRouter, HTTPException, Header
 from app.config import VALID_TICKERS
 from app.db.database import db_cursor
@@ -9,13 +9,25 @@ from app.services.prompts import PROMPT_VERSIONS, DEFAULT_PROMPT_VERSION
 
 router = APIRouter(prefix="/api/research", tags=["research"])
 
+SNAPSHOT_CACHE_TTL = timedelta(hours=12)
+
 
 def _get_snapshot_with_fallback(ticker: str, x_insightsentry_key: str | None):
-    """
-    Shared logic: try live fetch, cache on success, fall back to cache on
-    failure. Returns a dict with snapshot/data_sources/cached/etc, or raises
-    HTTPException if nothing is available.
-    """
+    with db_cursor() as cur:
+        cur.execute("SELECT data, source, fetched_at FROM snapshot_cache WHERE ticker = ?", (ticker,))
+        cached_row = cur.fetchone()
+
+    # Serve fresh-enough cache without touching Yahoo at all
+    if cached_row:
+        fetched_at = datetime.fromisoformat(cached_row["fetched_at"])
+        if datetime.utcnow() - fetched_at < SNAPSHOT_CACHE_TTL:
+            return {
+                "snapshot": json.loads(cached_row["data"]),
+                "data_sources": {"market_data": cached_row["source"]},
+                "cached": True,
+                "cached_at": cached_row["fetched_at"],
+            }
+
     try:
         result = market_data.get_snapshot(ticker, x_insightsentry_key)
         data = result.data
@@ -35,16 +47,14 @@ def _get_snapshot_with_fallback(ticker: str, x_insightsentry_key: str | None):
 
     except Exception as e:
         print(f"[snapshot] live fetch failed for {ticker}: {e}")
-        with db_cursor() as cur:
-            cur.execute("SELECT data, source, fetched_at FROM snapshot_cache WHERE ticker = ?", (ticker,))
-            row = cur.fetchone()
 
-        if row:
+        # Fall back to stale cache if we have it, even past the TTL
+        if cached_row:
             return {
-                "snapshot": json.loads(row["data"]),
-                "data_sources": {"market_data": row["source"]},
+                "snapshot": json.loads(cached_row["data"]),
+                "data_sources": {"market_data": cached_row["source"]},
                 "cached": True,
-                "cached_at": row["fetched_at"],
+                "cached_at": cached_row["fetched_at"],
                 "warning": "Live data fetch failed; showing cached data.",
             }
 
@@ -52,7 +62,6 @@ def _get_snapshot_with_fallback(ticker: str, x_insightsentry_key: str | None):
             status_code=503,
             detail=f"Live fetch failed and no cached data available for {ticker}: {e}",
         )
-
 
 @router.get("/company/{ticker}/snapshot")
 def get_snapshot(
